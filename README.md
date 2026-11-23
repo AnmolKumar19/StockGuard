@@ -1,0 +1,455 @@
+# StockGuard
+
+A small order-and-inventory system built as **two genuinely independent microservices** in
+Java 21 / Spring Boot, with a React storefront. It exists to demonstrate one hard problem
+done properly: **not overselling stock when orders race for the last unit, across a service
+boundary.**
+
+- **Inventory Service** — owns stock levels and issues concurrency-safe *reservations* (holds). Its own PostgreSQL database.
+- **Order Service** — owns the order lifecycle (`PLACED → CONFIRMED → SHIPPED`, plus `REJECTED` / `CANCELLED`) and coordinates with Inventory over REST. Its own, separate PostgreSQL database.
+- **web** — a React SPA served by nginx, which also reverse-proxies `/api/*` to the two services so the browser sees a single origin.
+
+```
+                       ┌────────────────────────┐
+   browser  ──────────▶│  web  (nginx + React)  │
+   :8088               └───────┬────────────────┘
+                        /api/orders   /api/inventory
+                               │            │
+                     ┌─────────▼──────┐  ┌──▼───────────────┐
+                     │ Order Service  │  │ Inventory Service│
+                     │   :8080        │──▶│   :8081          │   REST: reserve / commit / release
+                     └──────┬─────────┘  └──────┬───────────┘
+                            │                   │
+                     ┌──────▼──────┐     ┌──────▼──────┐
+                     │  order_db   │     │ inventory_db│      one PostgreSQL per service
+                     └─────────────┘     └─────────────┘
+```
+
+There is **no shared database** and no cross-database foreign key. The Order Service stores a
+`reservation_id` (a UUID it generates) as its only link to Inventory; everything else crosses
+the wire as JSON.
+
+---
+
+## Why this shape, and not others
+
+| Decision | Choice | Reason |
+|---|---|---|
+| Split or monolith? | Two services, two databases | The interesting problem (concurrent reservation across a boundary, partial failure, retries) only exists if the boundary is real. A shared DB would erase it. |
+| REST or a message broker? | Synchronous REST + a reservation/hold pattern | Placing an order genuinely *is* a request/response question ("can I have this stock — yes or no?"). A broker in the middle of an RPC is just RPC with more moving parts. A broker would earn its place for fan-out events (`OrderShipped` → notifications, analytics) — services this project doesn't have. |
+| No Spring Cloud (Eureka / Config Server / Gateway) | Deliberately omitted | Two services and one compose file don't have the problems those solve. A plain nginx reverse proxy gives the single-origin frontend without the ceremony. |
+| Auth | Not implemented | `customerId` is passed in the request body. JWT would slot in at the gateway; it isn't what this project is about. |
+
+---
+
+## The concurrency problem (the point of the project)
+
+**The race:** `available_quantity = 1`. Two reservation requests arrive within microseconds.
+Both read `1`, both check `1 >= 1`, both write `0`. Two units sold, one in the warehouse.
+
+StockGuard prevents this with **three layers**, all in the Inventory Service — the single place
+where stock is enforced:
+
+### 1. Atomic conditional decrement (the hot path)
+
+Holding stock is **one statement**, never a read-then-write in Java:
+
+```sql
+UPDATE inventory_item
+   SET available_quantity = available_quantity - :qty,
+       reserved_quantity  = reserved_quantity  + :qty
+ WHERE sku = :sku
+   AND available_quantity >= :qty      -- the guard
+```
+
+PostgreSQL takes a row lock for the duration of that statement, so two requests racing for
+the same SKU are **serialised on the row**. The `available_quantity >= :qty` guard is
+therefore always evaluated against a committed value. The first request wins (1 row updated);
+the second sees the updated value and is rejected (0 rows updated). No lost update, no
+negative stock. This is `InventoryItemRepository.reserve(...)`; the decision logic that reads
+its row-count is in `ReservationService.reserve(...)`.
+
+*Why this over pessimistic `SELECT … FOR UPDATE`?* Same correctness, but a single atomic
+statement holds its lock for microseconds instead of for the length of a transaction, has no
+deadlock surface for single-SKU holds, and degrades better under a last-unit stampede — which
+is exactly the contention profile that matters here.
+
+### 2. `@Version` optimistic locking (the cold path)
+
+Admin restock / correction (`PATCH /api/v1/inventory/{sku}`) *does* do a genuine
+read-modify-write on the JPA entity, so it carries a `@Version` column. A concurrent change
+throws `ObjectOptimisticLockingFailureException`; `InventoryService.adjustStock` retries the
+whole transaction up to 3× with jittered backoff before giving up with `409`.
+
+### 3. A hard database floor
+
+`CHECK (available_quantity >= 0)` and `CHECK (reserved_quantity >= 0)` in the schema. Even a
+logic bug cannot persist negative stock — the database refuses the write.
+
+### Multi-line orders are all-or-nothing
+
+A reservation with three SKUs holds all three or none. `ReservationService.reserve` runs in
+one transaction, processes lines **in SKU order** (a stable lock-acquisition order, so two
+concurrent multi-line reservations can't deadlock), and if any line can't be held it throws —
+rolling back every line that already succeeded *and* the reservation row itself. A rejected
+reservation leaves no trace, which makes retrying one naturally safe.
+
+### Idempotency
+
+The Order Service generates a `reservationId` per order and reuses it on every retry. The
+Inventory Service inserts that id (unique constraint) **before** touching stock, so two
+requests with the same id are serialised on the index: the second either sees the committed
+winner and replays its result, or — if the winner rolled back — proceeds on its own. A
+retried reserve can therefore never double-decrement. `POST /api/v1/reservations` returns
+`201` for a fresh hold and `200` (`replayed: true`) for a replay.
+
+### Holds don't leak
+
+A `@Scheduled` sweeper in the Inventory Service releases any `CONFIRMED` reservation older
+than its TTL (default 15 min). If the Order Service crashes between reserving and
+committing, the stock comes back on its own.
+
+### Proof
+
+`inventory-service` `ReservationConcurrencyIT` (real PostgreSQL via Testcontainers):
+
+- 40 threads race for `available_quantity = 1` → **exactly 1** succeeds, 39 get `409`, the row ends at `available = 0, reserved = 1`, never negative.
+- 50 threads, `available = 10` → **exactly 10** succeed.
+- 20 threads submit the **same** `reservationId` concurrently → stock moves **once**.
+- A multi-line reservation with one short line → the whole thing rolls back; the line that could have been held is untouched.
+
+---
+
+## Inter-service failure handling (Order Service)
+
+The order is persisted as `PLACED` in a short transaction. The reservation call to Inventory
+then happens **with no transaction and no database connection held** (`OrderService` uses a
+`TransactionTemplate` around each DB step, not an `@Transactional` method wrapping the network
+call). The result is applied in a second short transaction.
+
+The HTTP call is wrapped in **Resilience4j**:
+
+- **Timeouts** on the client itself — 500 ms connect, 2 s read. A hung Inventory Service can't hang an order.
+- **Retry** — 3 attempts, exponential backoff + jitter, **only** for `InventoryUnavailableException` (timeout / connection refused / 5xx). A `409` is a final answer and is never retried.
+- **Circuit breaker** — sustained failures open it; further calls fail fast instead of piling on.
+
+What the caller sees:
+
+| Inventory result | Order becomes | `POST /orders` returns |
+|---|---|---|
+| Reserved | `CONFIRMED` | `201`, `status: CONFIRMED` |
+| `409` insufficient | `REJECTED` (+ `rejectionReason`) | `201`, `status: REJECTED` |
+| Timeout / 5xx / circuit open, after retries | stays `PLACED` | `201`, `status: PLACED` |
+
+A `PLACED` order isn't lost: `PendingOrderReconciler` re-attempts the reservation on a timer
+(reusing the same `reservationId`, so it's safe) and moves the order to `CONFIRMED` or
+`REJECTED`. `order-service` `StockGuardIT` covers all three paths, including "Inventory down →
+order stays PLACED → Inventory recovers → reconciler confirms it".
+
+---
+
+## Domain-driven design
+
+Full write-up: **[docs/domain-design.md](docs/domain-design.md)** — the two bounded contexts
+(Order Management, Inventory Management) as they actually exist in the code, the context map
+between them, and a real refactor on top of them:
+
+- **An aggregate invariant that didn't exist before this refactor:** `Order.addItem()` used to
+  have no guard at all — every caller just happened to only use it correctly. It now refuses
+  to add a line item to any order that isn't `PLACED` (confirmed, shipped, rejected, or
+  cancelled), throwing a dedicated `OrderItemsLockedException` mapped to `409`. Proven by
+  `OrderTest`, including a before/after check that the test genuinely fails without the guard.
+- **A real domain event, `OrderShipped`**, recorded by the aggregate on `ship()` and published
+  after the transition is durably committed. It stays internal to the Order Service on
+  purpose — stated honestly, not dressed up as cross-service messaging StockGuard doesn't have
+  — and is consumed by a Micrometer counter (`stockguard.orders.shipped`) that neither `Order`
+  nor `OrderService` has any reference to, proven end-to-end in `StockGuardIT`.
+- **A second domain event, `OrderConfirmed`**, same shape: recorded by `Order.confirm()`,
+  published only `AFTER_COMMIT`, consumed by something that neither `Order` nor `OrderService`
+  knows exists — in this case `storage.ReceiptStorageListener`, which builds a JSON receipt
+  (`storage.ReceiptJson`, a pure function, unit-tested with no Spring context at all) and hands
+  it to `storage.ReceiptStorageService`, a real AWS S3 `putObject` call via the AWS SDK v2.
+  `ReceiptStorageServiceTest` verifies the S3 interaction with a Mockito-mocked `S3Client` — no
+  AWS account, no network, no Docker needed to verify it. The bucket
+  (`stockguard.receipts.bucket`) is unset by default, so the service is a documented no-op until
+  it's configured — an S3 outage was a deliberate non-goal to let break order confirmation.
+
+---
+
+## Running it
+
+### Everything, in containers
+
+```bash
+docker compose up --build
+```
+
+Then:
+
+| URL | What |
+|---|---|
+| http://localhost:8088 | the storefront |
+| http://localhost:8081/swagger-ui.html | Inventory Service API |
+| http://localhost:8080/swagger-ui.html | Order Service API |
+
+Compose starts five containers — `inventory-db`, `order-db`, `inventory-service`,
+`order-service`, `web` — with health checks, so `order-service` only starts once
+`inventory-service` reports healthy. Databases keep their data in named volumes; wipe with
+`docker compose down -v`.
+
+**Try the race yourself:** open the storefront in two tabs and order the last unit of
+"Collector Edition" from both at once. One order is `CONFIRMED`, the other `REJECTED`.
+
+### Services locally (without Docker)
+
+Each service needs a PostgreSQL. With the compose databases running (`docker compose up
+inventory-db order-db`):
+
+```bash
+cd inventory-service && ./mvnw spring-boot:run     # :8081
+cd order-service     && ./mvnw spring-boot:run     # :8080  (needs Inventory up)
+cd frontend          && npm install && npm run dev  # :5173, proxies /api/* to :8081 / :8080
+```
+
+### On Render
+
+[`render.yaml`](render.yaml) is a Blueprint that provisions the whole system: two managed
+PostgreSQL instances (one per service), the two Spring services as Docker web services, and
+the nginx `web` service. In the Render dashboard: **New → Blueprint → point at this repo**.
+
+The apps are PaaS-portable without code changes:
+
+- both services bind `$PORT` (`server.port: ${PORT:...}`);
+- the datasource URL falls back to being assembled from `*_DB_HOST` / `*_DB_PORT` / `*_DB_NAME` (what a managed provider gives you), so `render.yaml` wires those with `fromDatabase`;
+- the gateway's upstreams and the Order Service's inventory URL come from env (`PROXY_SCHEME`, `*_UPSTREAM_HOST`, `INVENTORY_SCHEME`/`INVENTORY_HOST`), wired with `fromService` — no hostnames are hard-coded.
+
+Caveats: free Postgres instances expire after ~30 days and free web services cold-start
+(~50 s); the in-container Maven build may need `starter`-tier build resources. Bump the
+`plan:` fields for anything long-lived.
+
+---
+
+## Tests
+
+```bash
+cd inventory-service && ./mvnw verify      # unit (Surefire) + integration (Failsafe)
+cd order-service     && ./mvnw verify
+```
+
+- `./mvnw test` runs the fast unit tests only (JUnit 5 + Mockito).
+- `./mvnw verify` also runs `*IT` integration tests. These need **Docker** — they start a
+  real `postgres:16-alpine` via Testcontainers (H2 is avoided on purpose: it doesn't
+  reproduce PostgreSQL's row-locking). The Order Service ITs additionally stub the Inventory
+  Service with WireMock.
+- If Testcontainers can't reach your Docker daemon, point the ITs at a PostgreSQL you started
+  yourself: `./mvnw verify -Dit.postgres.url=jdbc:postgresql://localhost:5432/inventory_db`.
+
+Coverage of the failure modes (not just happy paths):
+
+| Test | Proves |
+|---|---|
+| `ReservationConcurrencyIT` | no oversell under 40–50 concurrent reservations; concurrent same-id decrements once; multi-line rollback |
+| `ReservationLifecycleIT` | reserve→commit / reserve→release maths; idempotent commit; expiry sweep returns stock |
+| `ReservationServiceTest`, `InventoryServiceTest` | shortfall vs unknown-SKU, duplicate-key → replay, optimistic-lock retry then give up |
+| `InventoryClientTest` | `409` → `InsufficientStockException` with parsed shortfalls; `500` and read-timeout → `InventoryUnavailableException`; `release` 404 → no-op |
+| `OrderServiceTest` | place → confirmed / rejected / stays-placed; ship & cancel state guards; reconciler; `ship()` publishes `OrderShipped` |
+| `StockGuardIT` | end-to-end place/reject/ship/cancel over HTTP; **Inventory down → PLACED → recovers → reconciled**; `OrderShipped` → Micrometer counter, verified end-to-end |
+| `OrderTest` | the `Order` aggregate's own invariants directly, no mocks: items can be added while `PLACED`, locked everywhere else — see [Domain-driven design](docs/domain-design.md) |
+
+---
+
+## UI tests and defect tracking
+
+Two additions on top of the system above: a real browser test suite, and real defect
+tickets filed against a real issue tracker. Neither changes the backend or frontend design;
+the frontend gained a handful of `data-testid` attributes purely as test hooks.
+
+### Selenium UI suite (`selenium-tests/`)
+
+A standalone Maven module (JUnit 5 + Selenium WebDriver 4 + WebDriverManager, consistent
+with the rest of the repo's Java/JUnit stack) that drives real, headless Chrome against the
+actual running storefront — no mocked browser, no stubbed backend. It covers three real
+user flows:
+
+| Test | Flow |
+|---|---|
+| `PlaceOrderUiTest` | Set a quantity on an in-stock catalogue item, place the order, confirm it renders as `CONFIRMED`. |
+| `OrderRejectionUiTest` | Request far more units than exist, confirm the order renders as `REJECTED` with the real shortfall reason on the order card. |
+| `OrderStatusUiTest` | Place an order, ship it from the UI, confirm the badge flips to `SHIPPED` — then independently re-fetches that order straight from the Order Service's own API (bypassing the browser) and asserts the two agree. |
+
+Run it against a running stack:
+
+```bash
+docker compose up -d --build          # or point at a deployed environment, see below
+cd selenium-tests
+./mvnw test
+```
+
+Configuration (system property or env var, either works):
+
+| Property | Env var | Default | Meaning |
+|---|---|---|---|
+| `stockguard.baseUrl` | `STOCKGUARD_BASE_URL` | `http://localhost:8088` | the storefront under test |
+| `stockguard.orderServiceUrl` | `ORDER_SERVICE_URL` | `http://localhost:8080` | Order Service API, used only for the independent check in `OrderStatusUiTest` |
+| `selenium.headless` | `SELENIUM_HEADLESS` | `true` | set `false` to watch the browser locally |
+
+```bash
+./mvnw test -Dstockguard.baseUrl=https://your-deployed-app.example.com \
+            -Dstockguard.orderServiceUrl=https://your-order-service.example.com
+```
+
+Every wait is an explicit `WebDriverWait` condition (element clickable, order count reaches
+N, status reaches one of a set) — there is no `Thread.sleep` anywhere in the suite, and each
+test uses a freshly generated `customerId` so runs never interfere with each other or with
+data left over from a previous run. Run three times back to back locally: 3/3 green,
+identical results.
+
+**A real bug this suite found:** while automating the rejection flow, the "order rejected"
+banner turned out to be unreadable in practice — `App.jsx`'s `placeOrder()` sets it, then
+immediately calls `refresh()`, whose success path unconditionally clears it
+(`setError(null)`), and the same clear fires again on every 3-second poll after that. The
+order's rejection reason is still correct and still shown on the order card (driven by a
+different, non-racy code path), so `OrderRejectionUiTest` asserts on that instead of pinning
+a wait on a banner that cannot reliably appear — see the Javadoc on that test for the full
+account. This is filed as a real ticket, not silently patched, since fixing frontend
+behaviour is outside this addition's scope:
+**KAN-2**.
+
+### JIRA defect tracking (`jira-integration/`)
+
+A small Python script, `jira-integration/create_defect_tickets.py`, that files real tickets
+in a real Atlassian Cloud (JIRA) project over the JIRA Cloud REST API v3 — no mocking, and
+it re-fetches each ticket after creating it to prove it actually exists rather than trusting
+the create call's response.
+
+Setup:
+
+```bash
+cd jira-integration
+pip install -r requirements.txt
+cp .env.example .env       # fill in real values — never commit this file
+python create_defect_tickets.py --dry-run    # prints the exact payloads, no network calls
+python create_defect_tickets.py              # creates + verifies both tickets for real
+```
+
+| Env var | Meaning |
+|---|---|
+| `JIRA_SITE_URL` | your Atlassian Cloud site, e.g. `https://your-domain.atlassian.net` |
+| `JIRA_EMAIL` | the Atlassian account the API token belongs to |
+| `JIRA_API_TOKEN` | generate at id.atlassian.com/manage-profile/security/api-tokens — **never commit this** |
+| `JIRA_PROJECT_KEY` | the target project's key |
+| `JIRA_ISSUE_TYPE` | optional, defaults to `Bug`; the script probes the project's real issue types and falls back to `Task` if `Bug` isn't one of them |
+
+It files two tickets, both real and verified — created via the API, then independently
+re-fetched with a separate GET to confirm they genuinely exist rather than trusting the
+create response:
+
+1. **KAN-1** — the historical oversell
+   defect: the concurrent-reservation race described above under "The concurrency problem",
+   written up as a proper bug report (title, description, repro steps) even though it's
+   already fixed, with a direct reference to `ReservationConcurrencyIT` as the regression
+   test that proves the fix holds.
+2. **KAN-2** — the rejection-banner race
+   found while building this suite (see above), with repro steps, the exact file/root cause,
+   and a reference to `OrderRejectionUiTest` as the coverage that documents it.
+
+Credentials are read from the environment only (via `python-dotenv` locally); `.env` is
+gitignored repo-wide and `.env.example` ships with placeholders only.
+
+---
+
+## Catalogue search and recommendations
+
+Two storefront features added on top of the order system: finding products, and suggesting what to add to the cart.
+
+**Search** (`GET /api/inventory/search?q=...&inStockOnly=false&limit=20`, Inventory Service). One PostgreSQL query combines three signals: a full-text *prefix* match (`mou` finds Mouse), trigram word similarity from `pg_trgm` (`keybord` finds Keyboard; threshold 0.55, picked by inspecting scores so `mou` does not match Monitor), and a SKU substring match. Results are ranked by full-text rank (weighted 2x) plus word similarity, then by name for a stable order. User input is reduced to letters, digits and spaces before it reaches `to_tsquery`/`LIKE`, so operators and wildcards cannot get through (`SearchQuery`). GIN indexes on `to_tsvector(name)` and on `name gin_trgm_ops` back it (migration `V3`).
+
+**Recommendations** (`GET /api/recommendations?sku=A&sku=B&limit=5`, Order Service). Item-to-item "frequently bought together": for each SKU in the cart, every other SKU is scored by the **Jaccard similarity** of their order sets (orders containing both / orders containing either), summed across the cart. Why Jaccard and not "most often seen together": a best-seller is in a huge share of orders, so a raw co-purchase count recommends the best-seller for everything. Jaccard divides that out. Only `CONFIRMED`/`SHIPPED` orders count, pairs seen fewer than 2 times are ignored (`recommendations.min-support`), and if there is too little history the list is topped up with the most-ordered SKUs, labelled `POPULAR` so a client can tell the difference. Stock belongs to the Inventory Service, so the UI hides sold-out suggestions itself.
+
+**Tests.** `RecommendationQualityIT` builds synthetic order history on real PostgreSQL where the right answer is known and one best-seller sits in most orders: the Jaccard ranking picks each product's real partner 5 out of 5 times, while a guard test shows a raw co-occurrence count would have picked the best-seller. It also checks that rejected/cancelled orders and one-off pairs are ignored and that cold start falls back to `POPULAR`. `InventorySearchIT` checks prefixes, typos, ranking, SKU matches, in-stock filtering, SQL-injection text and limit clamping against real PostgreSQL. Unit tests cover `SearchQuery`, the recommendation service and the controller.
+
+**Limits, stated plainly.**
+- The purchase history in a fresh database is **synthetic** (`V2__seed_order_history.sql`: customer `seed-history`, order numbers `SEED-...`) so the demo has something to show. Real orders are added on top of it. Delete that migration to start empty.
+- The recommender is a counting method, not a trained model; there is no per-customer personalisation. The test above shows it behaves as designed on constructed data, not that it would lift sales.
+- Search covers product names and SKUs only. It is not a general search engine (no synonyms, categories, or relevance learning).
+- Prices still live in the storefront's small price list; the added catalogue items fall back to a default price.
+
+## Frontend accessibility and responsive layout
+
+`frontend/a11y/audit.mjs` loads the built app in headless Chromium with a mocked API and runs **axe-core**
+(WCAG 2.0/2.1 A and AA rules) at a 1280px desktop width and a 360px phone width. It also checks that every
+interactive element can be reached with the Tab key, has a visible focus indicator, and that the page does not
+scroll horizontally. CI runs it on every change (`npm run a11y`).
+
+The first run found real problems, which are now fixed:
+
+| Finding | Fix |
+|---|---|
+| 3 quantity inputs had no accessible name (axe `label`, critical) | `aria-label` naming the product on quantity inputs, restock, add, ship and cancel buttons |
+| Footer text failed colour contrast (axe `color-contrast`, serious) | Darker muted text colour |
+| Page scrolled horizontally by 91px at 360px width | Table in a scrollable, keyboard-focusable region; grid children can shrink; phone layout rules |
+| No landmarks or skip link; errors not announced | `<main>`, "Skip to catalogue" link, `role="alert"` on errors, `role="status"` on search results, table caption and column scopes |
+| No visible focus style | `:focus-visible` outline; 32px minimum control height |
+
+Before: 2 axe violations (5 problems in total) across the two widths. After: 0 axe violations, 13 of 13 interactive
+elements reachable by keyboard, no horizontal overflow at 360px.
+
+Limits: this is an automated audit of one page against a mocked API. Automated rules find only part of the
+WCAG issues, so it is not a conformance claim, and no screen-reader or user testing was done.
+
+## Caching, correlation ids and metrics
+
+Added to make the services look like something you would run, not just test.
+
+**Redis read cache (Inventory Service).** `GET /api/v1/inventory/{sku}` is cache-aside: Redis first, then PostgreSQL, and the result is cached as JSON for `inventory.cache.ttl` (default 10 s). It is **off by default** (`INVENTORY_CACHE_ENABLED=false`), so the service still runs on PostgreSQL alone, which is how the Render deployment runs. `docker compose up` starts Redis and turns it on.
+
+- *Invalidation:* a restock/adjust evicts the SKU after it commits; reserve, commit, release and the expiry sweep evict the affected SKUs **after their transaction commits** (a `TransactionSynchronization`), so a read cannot re-cache the old row mid-write.
+- *Failure mode:* every Redis error (down, slow, corrupt value) is caught, counted and logged, and the read falls back to PostgreSQL. Redis timeouts are 200 ms so a sick cache cannot make reads slower than the database. Redis is deliberately excluded from the readiness check for the same reason.
+- *Not cached:* stock **reservation** never reads the cache. It stays on the atomic conditional `UPDATE` described above, so the cache cannot cause overselling. A cached quantity can be up to one TTL stale if an eviction is ever missed; that is the trade-off for cheap reads of the catalogue.
+
+**Correlation ids.** Both services accept or create an `X-Request-Id` (only `[A-Za-z0-9._-]{1,64}` is reused, anything else is replaced to prevent log injection), put it in the logging MDC (`%X{requestId}` in the log pattern) and return it on the response. The Order Service forwards it to the Inventory Service, so one order can be followed through both services' logs.
+
+**Metrics.** `/actuator/prometheus` on both services (Micrometer). Custom meters: `inventory.cache.requests{result=hit|miss|error}` and `inventory.reservations{outcome=confirmed|rejected|committed|released|expired}`, next to the standard JVM, HTTP and Hikari metrics.
+
+**Tests.** Unit tests for the cache logic, Redis failure handling, post-commit eviction, the request-id filter, the id propagation and reservation metrics. `RedisSkuCacheIT` runs against a real Redis (CI service container, or Testcontainers locally) and covers round-trip, TTL expiry and an unreachable Redis.
+
+**Honest limits.** No load test was run with the cache on, so there are no hit-rate or latency numbers. `/actuator/prometheus` is exposed without auth, as for a demo; put it behind a network rule in production. Prometheus and Grafana are not part of the compose file.
+
+## Layout
+
+```
+stockguard/
+├─ inventory-service/     Spring Boot · owns inventory_db · the stock-enforcement service
+│  └─ src/main/java/com/stockguard/inventory/
+│     ├─ domain/          InventoryItem (@Version), Reservation, ReservationLine
+│     ├─ repository/      the atomic conditional-UPDATE lives here
+│     ├─ service/         ReservationService (reserve/commit/release/sweep), InventoryService
+│     ├─ web/             controllers + RFC 7807 handler
+│     └─ scheduler/       expired-hold sweeper
+├─ order-service/         Spring Boot · owns order_db · order lifecycle + Inventory coordination
+│  └─ src/main/java/com/stockguard/order/
+│     ├─ domain/          Order (aggregate root: state machine + item-locking invariant), OrderItem
+│     │  └─ event/        OrderShipped (internal domain event) + its Micrometer listener
+│     ├─ client/          InventoryClient — Resilience4j retry + circuit breaker
+│     ├─ service/         OrderService — network calls outside transactions
+│     ├─ web/             controllers + RFC 7807 handler
+│     └─ scheduler/       stuck-order reconciler
+├─ frontend/              React + Vite SPA; built and served by nginx, which proxies /api/*
+├─ selenium-tests/        standalone Maven module: real headless-Chrome UI regression suite
+├─ jira-integration/      Python script filing real defect tickets via the JIRA Cloud REST API
+├─ docs/API.md            endpoint reference + example payloads
+└─ docker-compose.yml     5 services, health-gated startup, one DB per service
+```
+
+## Tech
+
+Java 21 · Spring Boot 3.4 · Spring Data JPA · PostgreSQL 16 · Flyway · Resilience4j ·
+Apache HttpClient 5 · springdoc-openapi · JUnit 5 · Mockito · Testcontainers · WireMock ·
+React 18 · Vite · nginx · Docker Compose · Render Blueprint · Selenium WebDriver ·
+WebDriverManager · JIRA Cloud REST API · Micrometer.
+
+## API tests and load test
+
+- **`api-tests/`** (Rest Assured + TestNG): 18 black-box tests against a running stack, covering creation, duplicate SKUs, validation (RFC 7807 problem bodies), restock and over-deduction, name search incl. typo tolerance, order placement/rejection, cancel and ship effects on stock, state-transition conflicts and listing order. Each test creates its own uniquely named data. Run: `docker compose up -d --build --wait` then `cd api-tests && mvn test` (override URLs with `-Dstockguard.inventoryUrl=... -Dstockguard.orderUrl=...`).
+- **`perf/stockguard-load.jmx`** (Apache JMeter): 20 virtual shoppers for 40 s running search, item lookup, order placement and order history with 200 ms think time. `perf/check_results.py` fails the build if the error rate exceeds 1%, any endpoint's p95 exceeds 2000 ms, or fewer than 200 samples were produced. Limits are loose on purpose because CI runners are small and shared; they catch regressions, not absolute capacity. Do not read the CI numbers as production capacity.
+- Both run in the `system-tests` CI job together with `scripts/e2e-oversell.sh`; the JMeter HTML report is uploaded as an artifact.

@@ -1,0 +1,74 @@
+server:
+  # Render (and most PaaS) inject the port to bind as $PORT.
+  port: ${PORT:8081}
+
+spring:
+  application:
+    name: inventory-service
+  datasource:
+    # A full INVENTORY_DB_URL wins (docker-compose sets it directly). Otherwise the URL is
+    # assembled from discrete parts, which is what a managed-Postgres provider hands you.
+    url: ${INVENTORY_DB_URL:jdbc:postgresql://${INVENTORY_DB_HOST:localhost}:${INVENTORY_DB_PORT:5432}/${INVENTORY_DB_NAME:inventory_db}?sslmode=${INVENTORY_DB_SSLMODE:prefer}}
+    username: ${INVENTORY_DB_USER:inventory}
+    password: ${INVENTORY_DB_PASSWORD:inventory}
+    hikari:
+      pool-name: inventory-pool
+      maximum-pool-size: 16
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # Fail fast: a slow Redis must never make a read slower than the database it fronts.
+      timeout: 200ms
+      connect-timeout: 200ms
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate.jdbc.time_zone: UTC
+      hibernate.query.fail_on_pagination_over_collection_fetch: true
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+inventory:
+  cache:
+    # Off by default so the service runs with PostgreSQL alone (e.g. the Render deployment).
+    enabled: ${INVENTORY_CACHE_ENABLED:false}
+    # Upper bound on staleness if an invalidation is ever missed.
+    ttl: PT10S
+  reservation:
+    # How long a CONFIRMED (but not yet committed) hold survives before the sweeper releases it.
+    ttl: PT15M
+    sweep-interval: PT1M
+    sweep-enabled: true
+    # Bounded retry for the optimistic-locked restock/adjust path.
+    adjust-max-retries: 3
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+  api-docs:
+    path: /v3/api-docs
+
+management:
+  health:
+    redis:
+      # The cache is optional and degrades to PostgreSQL, so Redis must not affect readiness.
+      enabled: false
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+logging:
+  pattern:
+    level: "%5p [%X{requestId:-}]"
+  level:
+    com.stockguard.inventory: DEBUG
