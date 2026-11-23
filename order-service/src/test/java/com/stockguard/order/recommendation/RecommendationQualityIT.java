@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -33,7 +34,7 @@ class RecommendationQualityIT extends AbstractPostgresIntegrationTest {
         for (int i = 1; i <= PAIRS; i++) {
             // 40 orders contain A_i. 30 of them also contain the popular N1; 15 also contain B_i.
             for (int k = 0; k < 40; k++) {
-                java.util.ArrayList<String> skus = new java.util.ArrayList<>(List.of("EVAL-A" + i));
+                List<String> skus = new ArrayList<>(List.of("EVAL-A" + i));
                 if (k < 30) skus.add("EVAL-N1");
                 if (k >= 25) skus.add("EVAL-B" + i);
                 insertOrder("CONFIRMED", skus);
@@ -102,8 +103,14 @@ class RecommendationQualityIT extends AbstractPostgresIntegrationTest {
 
     @Test
     void demo_seed_history_recommends_the_keyboard_for_a_mouse() {
-        assertThat(service.recommend(List.of("SKU-MOUSE"), 2)).extracting(Recommendation::sku)
-                .first().isEqualTo("SKU-KEYBOARD");
+        for (int k = 0; k < 5; k++) {
+            insertOrder("CONFIRMED", List.of("SKU-MOUSE", "SKU-KEYBOARD"));
+        }
+
+        assertThat(service.recommend(List.of("SKU-MOUSE"), 2))
+                .extracting(Recommendation::sku)
+                .first()
+                .isEqualTo("SKU-KEYBOARD");
     }
 
     private void insertOrder(String status, List<String> skus) {
