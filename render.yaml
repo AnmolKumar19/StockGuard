@@ -1,33 +1,12 @@
 # Render Blueprint - https://render.com/docs/blueprint-spec
 #
-# Deploys the same repo as five Render resources:
-#   - two managed PostgreSQL instances  (one per service - the point of the project)
-#   - inventory-service, order-service  (Docker web services, bind $PORT)
-#   - web                               (nginx: serves the SPA, proxies /api/* to the two services)
-#
-# Cross-service wiring is resolved by Render: `fromDatabase` injects DB connection parts,
-# `fromService` injects each service's public hostname. No hostnames are hard-coded here.
-#
-# Notes:
-#   * Free Postgres instances expire after ~30 days and free web services cold-start (~50s).
-#     Bump `plan:` to `starter` for anything long-lived; the Maven image build may also need
-#     `starter` build resources.
-#   * IMPORTANT: the three *_HOST values below assume Render keeps the plain service
-#     subdomains. If your dashboard shows a suffixed URL for a service (e.g.
-#     stockguard-inventory-ab12.onrender.com), update INVENTORY_HOST / INVENTORY_UPSTREAM_HOST /
-#     ORDER_UPSTREAM_HOST to match, then Manual Sync + redeploy `stockguard-web`.
-#   * After the first deploy, open https://<stockguard-web-url>/
+# Single free PostgreSQL database shared by both services to fit Render's
+# 1-free-database-per-workspace limit, alongside the three Docker web services.
 
 databases:
   - name: stockguard-inventory-db
     databaseName: inventory_db
     user: inventory
-    plan: free
-    region: oregon
-
-  - name: stockguard-order-db
-    databaseName: order_db
-    user: orders
     plan: free
     region: oregon
 
@@ -68,20 +47,20 @@ services:
     autoDeploy: true
     envVars:
       - key: ORDER_DB_HOST
-        fromDatabase: { name: stockguard-order-db, property: host }
+        fromDatabase: { name: stockguard-inventory-db, property: host }
       - key: ORDER_DB_PORT
-        fromDatabase: { name: stockguard-order-db, property: port }
+        fromDatabase: { name: stockguard-inventory-db, property: port }
       - key: ORDER_DB_NAME
-        fromDatabase: { name: stockguard-order-db, property: database }
+        fromDatabase: { name: stockguard-inventory-db, property: database }
       - key: ORDER_DB_USER
-        fromDatabase: { name: stockguard-order-db, property: user }
+        fromDatabase: { name: stockguard-inventory-db, property: user }
       - key: ORDER_DB_PASSWORD
-        fromDatabase: { name: stockguard-order-db, property: password }
+        fromDatabase: { name: stockguard-inventory-db, property: password }
       - key: ORDER_DB_SSLMODE
         value: require
       - key: INVENTORY_SCHEME
         value: https
-      # Public hostname of the inventory service (see note at top of file if suffixed).
+      # Public hostname of the inventory service (update if Render suffixes the URL).
       - key: INVENTORY_HOST
         value: stockguard-inventory.onrender.com
 
@@ -98,7 +77,7 @@ services:
     envVars:
       - key: PROXY_SCHEME
         value: https
-      # Public hostnames of the two services (see note at top of file if suffixed).
+      # Public hostnames of the two services (update if Render suffixes either URL).
       - key: INVENTORY_UPSTREAM_HOST
         value: stockguard-inventory.onrender.com
       - key: ORDER_UPSTREAM_HOST
