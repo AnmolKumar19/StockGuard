@@ -34,7 +34,7 @@ class ReceiptStorageServiceTest {
     }
 
     @Test
-    void uploads_to_the_configured_bucket_with_the_expected_key_and_content_type() {
+    void uploads_to_the_configured_bucket_with_the_expected_key_and_content_type() throws Exception {
         ReceiptStorageService service = new ReceiptStorageService(s3Client, "stockguard-receipts");
         when(s3Client.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
                 .thenReturn(PutObjectResponse.builder().build());
