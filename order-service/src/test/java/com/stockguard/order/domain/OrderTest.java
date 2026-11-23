@@ -1,5 +1,6 @@
 package com.stockguard.order.domain;
 
+import com.stockguard.order.domain.event.OrderConfirmed;
 import com.stockguard.order.domain.event.OrderShipped;
 import org.junit.jupiter.api.Test;
 
@@ -80,6 +81,7 @@ class OrderTest {
     @Test
     void shipping_records_exactly_one_OrderShipped_event_and_draining_it_clears_it() {
         Order order = confirmedOrder();
+        order.pullDomainEvents(); // drain OrderConfirmed recorded by confirm()
 
         order.ship();
 
@@ -99,7 +101,10 @@ class OrderTest {
     @Test
     void confirming_or_rejecting_does_not_record_a_shipped_event() {
         Order confirmed = confirmedOrder();
-        assertThat(confirmed.pullDomainEvents()).isEmpty();
+        assertThat(confirmed.pullDomainEvents())
+                .hasSize(1)
+                .first()
+                .isInstanceOf(OrderConfirmed.class);
 
         Order rejected = Order.place("ORD-TEST-5", UUID.randomUUID(), "cust-1");
         rejected.addItem("SKU-A", 1, BigDecimal.ONE);
